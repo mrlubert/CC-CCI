@@ -105,7 +105,7 @@ end
 -- Startup echo
 -------------------------------------------------
 color(colors.cyan)
-print("========== Twitch Bits → Cubes ==========")
+print("========== Twitch Bits -> Cubes ==========")
 color(colors.white)
 
 local function echo(k, v)
@@ -165,7 +165,7 @@ local function giveCubes(count)
   ))
 
   if not ok then
-    tellraw("[Bits→Cubes] Give failed")
+    tellraw("[Bits->Cubes] Give failed")
   end
 end
 
@@ -200,7 +200,7 @@ local function award(user, bits)
 
   giveCubes(cubes)
   tellraw(string.format(
-    "[Bits→Cubes] %s cheered %d → %d cube(s)",
+    "[Bits->Cubes] %s cheered %d -> %d cube(s)",
     user,
     bits,
     cubes
@@ -321,7 +321,7 @@ end
 
 local broadcasterId = getBroadcasterId()
 
-tellraw("[Bits→Cubes] Online")
+tellraw("[Bits->Cubes] Online")
 
 local WS = "wss://eventsub.wss.twitch.tv/ws"
 http.websocketAsync(WS)
@@ -345,7 +345,7 @@ while true do
           transport={method="websocket",session_id=d.payload.session.id}
         }
       )
-      tellraw("[Bits→Cubes] Subscribed")
+      tellraw("[Bits->Cubes] Subscribed")
 
     elseif t=="notification" then
       local ev = d.payload.event
