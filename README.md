@@ -2,7 +2,9 @@
 
 Run this on a CC:Tweaked Command Computer:
 
-    shell.run("wget https://raw.githubusercontent.com/mrlubert/CC-CCI/main/install.lua install.lua && lua install.lua")
+    wget https://raw.githubusercontent.com/mrlubert/CC-CCI/main/install.lua install.lua 
+    
+    install.lua
 
 This will:
 - Download the installer
