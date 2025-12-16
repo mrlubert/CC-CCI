@@ -1,8 +1,13 @@
 -- bits_cubes.lua
--- CC:Tweaked: Twitch Bits/Subs/Chat -> Chance Cubes (EventSub WebSockets)
+-- CC:Tweaked: Twitch Bits/Subs/Gifts/Chat -> Chance Cubes (EventSub WebSockets)
 -- Command Computer required + http enabled
 -- All config from .env (no hard-coded give/tellraw)
 -- Scope-aware OAuth: re-auth only when required scopes change (backs up old token file)
+--
+-- IMPORTANT CHANGE:
+--  - Gift bombs are handled via: channel.subscription.gift
+--  - Regular subs are handled via: channel.subscribe (NON-gift only)
+--  This prevents missing gifts and prevents double-counting.
 
 local ENV_PATH   = ".env"
 local TOKEN_FILE = "twitch_tokens.json"
@@ -86,12 +91,6 @@ local function envNumOptional(k, def)
   if raw == nil or raw == "" then return def end
   local v = tonumber(raw)
   if v == nil then return def end
-  return v
-end
-
-local function envStrOptional(k, def)
-  local v = ENV[k]
-  if v == nil or v == "" then return def end
   return v
 end
 
@@ -308,32 +307,45 @@ local function awardBits(user, bits)
 end
 
 -------------------------------------------------
--- Subs handling
+-- Sub/Gift handling
 -------------------------------------------------
-local function cubesForSubEvent(ev)
-  if ev.is_prime == true then return CUBES_SUB_PRIME end
-  local tier = tostring(ev.tier or "1000")
+local function cubesForTier(tierStr, isPrime)
+  if isPrime == true then return CUBES_SUB_PRIME end
+  local tier = tostring(tierStr or "1000")
   if tier == "3000" then return CUBES_SUB_T3 end
   if tier == "2000" then return CUBES_SUB_T2 end
   return CUBES_SUB_T1
 end
 
+-- Regular subs only (ignore gifts here to avoid double counting)
 local function handleSubscribeEvent(ev)
-  local perSub = cubesForSubEvent(ev)
-  local isGift = (ev.is_gift == true)
-
-  if isGift then
-    local count = tonumber(ev.total or 1) or 1
-    local cubes = count * perSub
-    giveCubes(cubes)
-
-    local gifter = sanitizeText(ev.gifter_name or ev.gifter_login or "Someone")
-    tellrawCubes(string.format("%s gifted %d sub(s) -> %d cube(s)", gifter, count, cubes))
-  else
-    local user = sanitizeText(ev.user_name or ev.user_login or "Someone")
-    giveCubes(perSub)
-    tellrawCubes(string.format("%s subscribed -> %d cube(s)", user, perSub))
+  if ev.is_gift == true then
+    -- Gift recipients may fire as channel.subscribe events; we ignore them
+    -- because we award from channel.subscription.gift (bomb total).
+    return
   end
+
+  local perSub = cubesForTier(ev.tier, ev.is_prime)
+  local user = sanitizeText(ev.user_name or ev.user_login or "Someone")
+
+  giveCubes(perSub)
+  tellrawCubes(string.format("%s subscribed -> %d cube(s)", user, perSub))
+end
+
+-- Gift bombs (community gifts) handled here
+local function handleGiftEvent(ev)
+  -- Gift event includes tier and a count (total/quantity)
+  local perSub = cubesForTier(ev.tier, ev.is_prime)
+
+  -- Twitch may use "total" for community gifts; some payloads use "quantity".
+  local count = tonumber(ev.total or ev.quantity or ev.count or 1) or 1
+  if count < 1 then count = 1 end
+
+  local cubes = count * perSub
+  giveCubes(cubes)
+
+  local gifter = sanitizeText(ev.user_name or ev.user_login or ev.gifter_name or ev.gifter_login or "Someone")
+  tellrawCubes(string.format("%s gifted %d sub(s) -> %d cube(s)", gifter, count, cubes))
 end
 
 -------------------------------------------------
@@ -558,9 +570,17 @@ while true do
             transport = { method = "websocket", session_id = sessionId }
           })
 
-          -- Subs
+          -- Regular subs (we ignore gifts here)
           httpJson("POST", "https://api.twitch.tv/helix/eventsub/subscriptions", headers, {
             type = "channel.subscribe",
+            version = "1",
+            condition = { broadcaster_user_id = broadcasterId },
+            transport = { method = "websocket", session_id = sessionId }
+          })
+
+          -- Gift bombs (this is the reliable count)
+          httpJson("POST", "https://api.twitch.tv/helix/eventsub/subscriptions", headers, {
+            type = "channel.subscription.gift",
             version = "1",
             condition = { broadcaster_user_id = broadcasterId },
             transport = { method = "websocket", session_id = sessionId }
@@ -592,6 +612,9 @@ while true do
 
           elseif sub.type == "channel.subscribe" then
             handleSubscribeEvent(ev)
+
+          elseif sub.type == "channel.subscription.gift" then
+            handleGiftEvent(ev)
 
           elseif sub.type == "channel.chat.message" then
             handleChatMessageEvent(ev)
