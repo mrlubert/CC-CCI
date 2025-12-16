@@ -14,6 +14,10 @@ This will:
 
 NOTE: HTTP must be enabled in CC:Tweaked (http.enabled = true)
 
+```
+https://id.twitch.tv/oauth2/authorize?client_id=YOURIDHERE&redirect_uri=http%3A%2F%2Flocalhost&response_type=code&scope=bits%3Aread%20channel%3Aread%3Asubscriptions%20user%3Aread%3Achat
+```
+
 ---
 
 # Twitch Bits -> Chance Cubes (CC:Tweaked)

@@ -1,7 +1,8 @@
--- twitch_bits_cubes.lua
--- Pure CC:Tweaked Twitch Bits/Subs/Chat -> Chance Cubes
--- EVERYTHING command-related comes from .env
--- Requires: Command Computer + http enabled
+-- bits_cubes.lua
+-- CC:Tweaked: Twitch Bits/Subs/Chat -> Chance Cubes (EventSub WebSockets)
+-- Command Computer required + http enabled
+-- All config from .env (no hard-coded give/tellraw)
+-- Scope-aware OAuth: re-auth only when required scopes change (backs up old token file)
 
 local ENV_PATH   = ".env"
 local TOKEN_FILE = "twitch_tokens.json"
@@ -14,25 +15,23 @@ local function trim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
 
 local function normalize(s)
   s = trim(s or "")
-  if s:sub(1,1) == "/" then s = s:sub(2) end
+  if s:sub(1, 1) == "/" then s = s:sub(2) end
   return s
 end
 
 local function clampLen(s, n)
   s = tostring(s or "")
   if n and n > 0 and #s > n then
-    return s:sub(1, n - 3) .. "..."
+    return s:sub(1, math.max(1, n - 3)) .. "..."
   end
   return s
 end
 
--- Make chat safe for JSON + avoid unicode weirdness
+-- Keep it simple and safe for server chat pipelines
 local function sanitizeText(s)
   s = tostring(s or "")
-  -- strip non-ascii to avoid encoding garble in some servers/packs
+  -- Replace non-ascii with '?'
   s = s:gsub("[^\x20-\x7E]", "?")
-  -- escape for JSON string
-  s = s:gsub("\\", "\\\\"):gsub('"', '\\"')
   return s
 end
 
@@ -40,7 +39,10 @@ end
 -- .env loader
 -------------------------------------------------
 local function loadEnv()
-  if not fs.exists(ENV_PATH) then error("Missing .env file", 0) end
+  if not fs.exists(ENV_PATH) then
+    error("Missing .env file", 0)
+  end
+
   local f = fs.open(ENV_PATH, "r")
   local txt = f.readAll()
   f.close()
@@ -62,7 +64,9 @@ end
 local ENV = loadEnv()
 
 local function requireEnv(k)
-  if ENV[k] == nil then error("Missing .env key: " .. k, 0) end
+  if ENV[k] == nil then
+    error("Missing .env key: " .. k, 0)
+  end
   return ENV[k]
 end
 
@@ -103,9 +107,9 @@ local MC_PLAYER     = requireEnv("MC_PLAYER")
 local CUBE_ITEM     = requireEnv("CUBE_ITEM_ID")
 local BITS_PER_CUBE = envNumRequired("BITS_PER_CUBE")
 
--- These are the actual command strings (can be wrappers too)
-local TELLRAW_CMD = normalize(requireEnv("MC_TELLRAW_PREFIX"))
-local GIVE_CMD    = normalize(requireEnv("MC_GIVE_PREFIX"))
+-- Actual command strings (can be wrappers)
+local TELLRAW_CMD = normalize(requireEnv("MC_TELLRAW_PREFIX")) -- e.g. "tellraw" or "execute as X run tellraw"
+local GIVE_CMD    = normalize(requireEnv("MC_GIVE_PREFIX"))    -- e.g. "give" or "execute as X run give"
 
 local DEBUG_COMMANDS = envBool(requireEnv("DEBUG_COMMANDS"))
 
@@ -117,8 +121,16 @@ local CUBES_SUB_T3    = envNumRequired("CUBES_SUB_T3")
 
 -- Twitch chat relay (toggle)
 local RELAY_TWITCH_CHAT = envBool(requireEnv("RELAY_TWITCH_CHAT"))
-local CHAT_RELAY_PREFIX = envStrOptional("CHAT_RELAY_PREFIX", "[Twitch]")
 local CHAT_RELAY_MAXLEN = envNumOptional("CHAT_RELAY_MAXLEN", 180)
+
+-- JSON prefix styling (replaces unreliable § codes)
+local PREFIX_CUBES_LABEL  = requireEnv("PREFIX_CUBES_LABEL")   -- e.g. Cubes
+local PREFIX_CUBES_COLOR  = requireEnv("PREFIX_CUBES_COLOR")   -- e.g. black
+local PREFIX_CUBES_ACCENT = requireEnv("PREFIX_CUBES_ACCENT")  -- e.g. aqua
+
+local PREFIX_TWITCH_LABEL  = requireEnv("PREFIX_TWITCH_LABEL") -- e.g. Twitch
+local PREFIX_TWITCH_COLOR  = requireEnv("PREFIX_TWITCH_COLOR") -- e.g. black
+local PREFIX_TWITCH_ACCENT = requireEnv("PREFIX_TWITCH_ACCENT")-- e.g. dark_purple
 
 -------------------------------------------------
 -- Terminal helpers
@@ -166,10 +178,9 @@ echo("Sub Cubes Tier1", CUBES_SUB_T1)
 echo("Sub Cubes Tier2", CUBES_SUB_T2)
 echo("Sub Cubes Tier3", CUBES_SUB_T3)
 echo("Relay Twitch Chat", RELAY_TWITCH_CHAT and "ON" or "OFF")
-if RELAY_TWITCH_CHAT then
-  echo("Chat Relay Prefix", CHAT_RELAY_PREFIX)
-  echo("Chat Relay MaxLen", CHAT_RELAY_MAXLEN)
-end
+if RELAY_TWITCH_CHAT then echo("Chat Relay MaxLen", CHAT_RELAY_MAXLEN) end
+echo("Prefix Cubes", "[" .. PREFIX_CUBES_LABEL .. "] (" .. PREFIX_CUBES_COLOR .. "/" .. PREFIX_CUBES_ACCENT .. ")")
+echo("Prefix Twitch", "[" .. PREFIX_TWITCH_LABEL .. "] (" .. PREFIX_TWITCH_COLOR .. "/" .. PREFIX_TWITCH_ACCENT .. ")")
 echo("Debug Commands", DEBUG_COMMANDS and "ON" or "OFF")
 
 color(colors.cyan)
@@ -188,18 +199,59 @@ local function runCommand(cmd)
 end
 
 -------------------------------------------------
--- Minecraft actions
+-- Tellraw helpers (JSON, reliable colors)
 -------------------------------------------------
-local function tellraw(msg)
-  msg = sanitizeText(msg)
-  runCommand(string.format(
-    "%s %s {\"text\":\"%s\"}",
-    TELLRAW_CMD,
-    MC_PLAYER,
-    msg
-  ))
+local function tellrawJSON(obj)
+  local json = textutils.serializeJSON(obj)
+  return runCommand(string.format('%s %s %s', TELLRAW_CMD, MC_PLAYER, json))
 end
 
+local function tellrawWithPrefix(prefixLabel, baseColor, accentColor, message)
+  message = sanitizeText(message)
+  local obj = {
+    text = "",
+    extra = {
+      { text = "[", color = baseColor },
+      { text = sanitizeText(prefixLabel), color = accentColor },
+      { text = "] ", color = baseColor },
+      { text = message, color = "white" }
+    }
+  }
+  tellrawJSON(obj)
+end
+
+local function tellrawCubes(msg)
+  tellrawWithPrefix(PREFIX_CUBES_LABEL, PREFIX_CUBES_COLOR, PREFIX_CUBES_ACCENT, msg)
+end
+
+local function tellrawTwitch(msg)
+  tellrawWithPrefix(PREFIX_TWITCH_LABEL, PREFIX_TWITCH_COLOR, PREFIX_TWITCH_ACCENT, msg)
+end
+
+local function tellrawClickable(prefixLabel, baseColor, accentColor, labelText, url)
+  labelText = sanitizeText(labelText)
+  url = tostring(url or "")
+  local obj = {
+    text = "",
+    extra = {
+      { text = "[", color = baseColor },
+      { text = sanitizeText(prefixLabel), color = accentColor },
+      { text = "] ", color = baseColor },
+      {
+        text = labelText,
+        color = "yellow",
+        underlined = true,
+        clickEvent = { action = "open_url", value = url },
+        hoverEvent = { action = "show_text", value = { text = "Click to open Twitch authorization" } }
+      }
+    }
+  }
+  tellrawJSON(obj)
+end
+
+-------------------------------------------------
+-- Give cubes
+-------------------------------------------------
 local function giveCubes(count)
   count = tonumber(count) or 0
   if count <= 0 then return end
@@ -212,7 +264,9 @@ local function giveCubes(count)
     count
   ))
 
-  if not ok then tellraw("§0[§bCubes§0]§f Give failed") end
+  if not ok then
+    tellrawCubes("Give failed")
+  end
 end
 
 -------------------------------------------------
@@ -240,14 +294,17 @@ end
 local bank = readJson(BANK_FILE) or { remainder = {} }
 
 local function awardBits(user, bits)
+  user = sanitizeText(user)
+  bits = tonumber(bits) or 0
+  if bits <= 0 then return end
+
   local total = (bank.remainder[user] or 0) + bits
   local cubes = math.floor(total / BITS_PER_CUBE)
-
   bank.remainder[user] = total % BITS_PER_CUBE
   writeJson(BANK_FILE, bank)
 
   if cubes > 0 then giveCubes(cubes) end
-  tellraw(string.format("§0[§bCubes§0]§f %s cheered %d -> %d cube(s)", user, bits, cubes))
+  tellrawCubes(string.format("%s cheered %d -> %d cube(s)", user, bits, cubes))
 end
 
 -------------------------------------------------
@@ -270,23 +327,22 @@ local function handleSubscribeEvent(ev)
     local cubes = count * perSub
     giveCubes(cubes)
 
-    local gifter = ev.gifter_name or ev.gifter_login or "Someone"
-    tellraw(string.format("§0[§bCubes§0]§f %s gifted %d sub(s) -> %d cube(s)", gifter, count, cubes))
+    local gifter = sanitizeText(ev.gifter_name or ev.gifter_login or "Someone")
+    tellrawCubes(string.format("%s gifted %d sub(s) -> %d cube(s)", gifter, count, cubes))
   else
-    local user = ev.user_name or ev.user_login or "Someone"
+    local user = sanitizeText(ev.user_name or ev.user_login or "Someone")
     giveCubes(perSub)
-    tellraw(string.format("§0[§bCubes§0]§f %s subscribed -> %d cube(s)", user, perSub))
+    tellrawCubes(string.format("%s subscribed -> %d cube(s)", user, perSub))
   end
 end
 
 -------------------------------------------------
--- Twitch chat relay handling
+-- Twitch chat relay
 -------------------------------------------------
 local function handleChatMessageEvent(ev)
   if not RELAY_TWITCH_CHAT then return end
 
-  -- EventSub chat payload typically includes user_name and message.text
-  local name = ev.chatter_user_name or ev.user_name or ev.chatter_user_login or ev.user_login or "chat"
+  local name = sanitizeText(ev.chatter_user_name or ev.user_name or ev.chatter_user_login or ev.user_login or "chat")
   local text = ""
 
   if ev.message and ev.message.text then
@@ -295,66 +351,60 @@ local function handleChatMessageEvent(ev)
     text = ev.text
   end
 
-  text = clampLen(text, CHAT_RELAY_MAXLEN)
-
-  -- Example: [Twitch] user: hello
-  tellraw(string.format("%s %s: %s", CHAT_RELAY_PREFIX, name, text))
+  text = sanitizeText(clampLen(text, CHAT_RELAY_MAXLEN))
+  tellrawTwitch(string.format("%s: %s", name, text))
 end
 
 -------------------------------------------------
--- OAuth helpers
+-- HTTP helpers
 -------------------------------------------------
 local function formEncode(t)
   local r = {}
-  for k,v in pairs(t) do
-    r[#r+1] = textutils.urlEncode(k).."="..textutils.urlEncode(v)
+  for k, v in pairs(t) do
+    r[#r+1] = textutils.urlEncode(k) .. "=" .. textutils.urlEncode(v)
   end
-  return table.concat(r,"&")
+  return table.concat(r, "&")
 end
 
 local function httpReq(o)
   http.request(o)
   while true do
-    local e,u,h = os.pullEvent()
-    if e=="http_success" and u==o.url then
-      local b=h.readAll(); h.close(); return true,b
-    elseif e=="http_failure" and u==o.url then
-      return false,nil
+    local e, u, h = os.pullEvent()
+    if e == "http_success" and u == o.url then
+      local b = h.readAll()
+      h.close()
+      return true, b
+    elseif e == "http_failure" and u == o.url then
+      return false, nil
     end
   end
 end
 
-local function httpJson(m,u,h,b,isForm)
-  h = h or {}
-  if b then
-    h["Content-Type"] = isForm and "application/x-www-form-urlencoded" or "application/json"
-    b = isForm and b or textutils.serializeJSON(b)
+local function httpJson(method, url, headers, body, isForm)
+  headers = headers or {}
+  local payload = nil
+  if body ~= nil then
+    headers["Content-Type"] = isForm and "application/x-www-form-urlencoded" or "application/json"
+    payload = isForm and body or textutils.serializeJSON(body)
   end
-  local ok,r = httpReq({url=u,method=m,headers=h,body=b})
-  if not ok or not r or r == "" then return nil end
-  local ok2, obj = pcall(textutils.unserializeJSON, r)
+
+  local ok, resp = httpReq({
+    url = url,
+    method = method,
+    headers = headers,
+    body = payload
+  })
+
+  if not ok or not resp or resp == "" then return nil end
+  local ok2, obj = pcall(textutils.unserializeJSON, resp)
   return ok2 and obj or nil
 end
 
 -------------------------------------------------
--- OAuth token handling
+-- OAuth: scope-aware
 -------------------------------------------------
-local function saveToken(t, scopeStr)
-  if not t or not t.expires_in then error("OAuth token response missing expires_in", 0) end
-  t.expires_at = os.epoch("utc")/1000 + t.expires_in - 30
-  -- record what scopes this token was authorized with (based on current .env)
-  t._requested_scopes = scopeStr
-  writeJson(TOKEN_FILE, t)
-  return t
-end
-
 local function buildScopes()
-  -- Always required
-  local scopes = {
-    "bits:read",
-    "channel:read:subscriptions"
-  }
-  -- Only request chat scope if relay is enabled
+  local scopes = { "bits:read", "channel:read:subscriptions" }
   if RELAY_TWITCH_CHAT then
     table.insert(scopes, "user:read:chat")
   end
@@ -363,22 +413,28 @@ end
 
 local function scopesChanged(token, desiredScopeStr)
   if not token then return true end
-  -- We store the previously requested scope string ourselves.
   local old = token._requested_scopes
   if type(old) ~= "string" or old == "" then
-    -- Older token file (before we stored scopes) -> treat as changed once.
-    return true
+    return true -- old token file didn’t store scopes
   end
   return old ~= desiredScopeStr
+end
+
+local function saveToken(t, scopeStr)
+  if not t or not t.expires_in then error("OAuth token response missing expires_in", 0) end
+  t.expires_at = os.epoch("utc") / 1000 + t.expires_in - 30
+  t._requested_scopes = scopeStr
+  writeJson(TOKEN_FILE, t)
+  return t
 end
 
 local function ensureToken()
   local desiredScopes = buildScopes()
   local t = readJson(TOKEN_FILE)
-  -- If token exists but scopes no longer match current config, force re-auth ONCE.
+
   if t and scopesChanged(t, desiredScopes) then
-    local backup = "twitch_tokens.old_" .. tostring(math.floor(os.epoch("utc")/1000)) .. ".json"
-    print("Token scopes changed (config updated). Re-authorization required.")
+    local backup = "twitch_tokens.old_" .. tostring(math.floor(os.epoch("utc") / 1000)) .. ".json"
+    print("OAuth scopes changed. Re-authorization required.")
     print("Backing up old token file to: " .. backup)
     if fs.exists(TOKEN_FILE) then
       fs.copy(TOKEN_FILE, backup)
@@ -386,57 +442,64 @@ local function ensureToken()
     end
     t = nil
   end
-  -- No token -> do full authorization flow
+
   if not t then
-    print("Authorize this app:")
-    print(
+    local authUrl =
       "https://id.twitch.tv/oauth2/authorize"
       .. "?client_id=" .. textutils.urlEncode(CLIENT_ID)
       .. "&redirect_uri=" .. textutils.urlEncode(REDIRECT_URI)
       .. "&response_type=code"
       .. "&scope=" .. textutils.urlEncode(desiredScopes)
-    )
+
+    print("Authorize this app (link also sent in-game):")
+    print(authUrl)
+    tellrawClickable(PREFIX_CUBES_LABEL, PREFIX_CUBES_COLOR, PREFIX_CUBES_ACCENT, "CLICK HERE to authorize Twitch", authUrl)
+
     write("> Paste code: ")
     local code = read()
+
     local resp = httpJson(
       "POST",
       "https://id.twitch.tv/oauth2/token",
       {},
       formEncode({
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET,
-        code=code,
-        grant_type="authorization_code",
-        redirect_uri=REDIRECT_URI
+        client_id = CLIENT_ID,
+        client_secret = CLIENT_SECRET,
+        code = code,
+        grant_type = "authorization_code",
+        redirect_uri = REDIRECT_URI
       }),
       true
     )
+
     if not resp or not resp.access_token then
       error("Failed to exchange auth code for tokens.", 0)
     end
+
     return saveToken(resp, desiredScopes)
   end
-  -- Token still valid
-  if os.epoch("utc")/1000 < (t.expires_at or 0) then
+
+  if os.epoch("utc") / 1000 < (t.expires_at or 0) then
     return t
   end
-  -- Refresh token (scopes stay the same)
+
   local resp = httpJson(
     "POST",
     "https://id.twitch.tv/oauth2/token",
     {},
     formEncode({
-      client_id=CLIENT_ID,
-      client_secret=CLIENT_SECRET,
-      grant_type="refresh_token",
-      refresh_token=t.refresh_token
+      client_id = CLIENT_ID,
+      client_secret = CLIENT_SECRET,
+      grant_type = "refresh_token",
+      refresh_token = t.refresh_token
     }),
     true
   )
+
   if not resp or not resp.access_token then
     error("Failed to refresh tokens. Delete twitch_tokens.json and re-authorize.", 0)
   end
-  -- Preserve the scopes we requested before saving refreshed token
+
   return saveToken(resp, desiredScopes)
 end
 
@@ -471,13 +534,13 @@ end
 
 local broadcasterId = getBroadcasterId()
 
-tellraw("§0[§bCubes§0]§f Online")
+tellrawCubes("Online")
 
 local WS = "wss://eventsub.wss.twitch.tv/ws"
 http.websocketAsync(WS)
 
 while true do
-  local e,_,payload = os.pullEvent()
+  local e, _, payload = os.pullEvent()
 
   if e == "websocket_message" then
     local ok, d = pcall(textutils.unserializeJSON, payload)
@@ -487,34 +550,33 @@ while true do
       if mtype == "session_welcome" then
         local sessionId = d.payload and d.payload.session and d.payload.session.id
         if sessionId then
-          -- Subscribe to bits
+          -- Bits
           httpJson("POST", "https://api.twitch.tv/helix/eventsub/subscriptions", headers, {
-            type="channel.cheer",
-            version="1",
-            condition={broadcaster_user_id=broadcasterId},
-            transport={method="websocket",session_id=sessionId}
+            type = "channel.cheer",
+            version = "1",
+            condition = { broadcaster_user_id = broadcasterId },
+            transport = { method = "websocket", session_id = sessionId }
           })
 
-          -- Subscribe to subs
+          -- Subs
           httpJson("POST", "https://api.twitch.tv/helix/eventsub/subscriptions", headers, {
-            type="channel.subscribe",
-            version="1",
-            condition={broadcaster_user_id=broadcasterId},
-            transport={method="websocket",session_id=sessionId}
+            type = "channel.subscribe",
+            version = "1",
+            condition = { broadcaster_user_id = broadcasterId },
+            transport = { method = "websocket", session_id = sessionId }
           })
 
-          -- Subscribe to chat messages (optional)
+          -- Chat relay (optional)
           if RELAY_TWITCH_CHAT then
-            -- channel.chat.message condition requires broadcaster_user_id AND user_id. :contentReference[oaicite:2]{index=2}
             httpJson("POST", "https://api.twitch.tv/helix/eventsub/subscriptions", headers, {
-              type="channel.chat.message",
-              version="1",
-              condition={broadcaster_user_id=broadcasterId, user_id=broadcasterId},
-              transport={method="websocket",session_id=sessionId}
+              type = "channel.chat.message",
+              version = "1",
+              condition = { broadcaster_user_id = broadcasterId, user_id = broadcasterId },
+              transport = { method = "websocket", session_id = sessionId }
             })
           end
 
-          tellraw("§0[§bCubes§0]§f Subscribed")
+          tellrawCubes("Subscribed")
         end
 
       elseif mtype == "notification" then
