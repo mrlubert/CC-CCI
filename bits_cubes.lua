@@ -4,14 +4,15 @@
 -- All config from .env (no hard-coded give/tellraw)
 -- Scope-aware OAuth: re-auth only when required scopes change (backs up old token file)
 --
--- LIVE MODE (recommended):
---  - Subscribes to EventSub: stream.online + stream.offline
---  - Script ONLY awards cubes / relays chat while LIVE
---  - When LIVE status changes, runs: /<MC_STREAMING_PREFIX> <MC_PLAYER>
+-- LIVE MODE (Option 2 - prefix style):
+--  - Uses MC_LIVE_PREFIX + MC_OFFLINE_PREFIX (prefix-only commands)
+--  - Runs: <MC_LIVE_PREFIX> <MC_PLAYER> when stream goes LIVE
+--  - Runs: <MC_OFFLINE_PREFIX> <MC_PLAYER> when stream goes OFFLINE
+--  - Rewards/chat relay only happen while LIVE
 --
--- IMPORTANT CHANGE FOR GIFT BOMBS:
+-- IMPORTANT:
 --  - Gift bombs handled via: channel.subscription.gift (reliable count)
---  - Regular subs handled via: channel.subscribe (NON-gift only)
+--  - Regular subs handled via: channel.subscribe (NON-gift only) to avoid double counting
 
 local ENV_PATH   = ".env"
 local TOKEN_FILE = "twitch_tokens.json"
@@ -36,7 +37,7 @@ local function clampLen(s, n)
   return s
 end
 
--- Keep it simple and safe for server chat pipelines (no unicode headaches)
+-- Keep it simple & safe: remove weird Unicode pipelines
 local function sanitizeText(s)
   s = tostring(s or "")
   s = s:gsub("[^\x20-\x7E]", "?")
@@ -110,11 +111,12 @@ local CUBE_ITEM     = requireEnv("CUBE_ITEM_ID")
 local BITS_PER_CUBE = envNumRequired("BITS_PER_CUBE")
 
 -- Actual command strings (can be wrappers)
-local TELLRAW_CMD = normalize(requireEnv("MC_TELLRAW_PREFIX")) -- e.g. tellraw OR execute as X run tellraw
-local GIVE_CMD    = normalize(requireEnv("MC_GIVE_PREFIX"))    -- e.g. give   OR execute as X run give
+local TELLRAW_CMD = normalize(requireEnv("MC_TELLRAW_PREFIX")) -- e.g. tellraw OR execute ... run tellraw
+local GIVE_CMD    = normalize(requireEnv("MC_GIVE_PREFIX"))    -- e.g. give   OR execute ... run give
 
--- /streaming <player> command hook
-local STREAMING_CMD = normalize(requireEnv("MC_STREAMING_PREFIX")) -- e.g. streaming
+-- LIVE/OFFLINE command prefixes (Option 2)
+local LIVE_PREFIX    = normalize(requireEnv("MC_LIVE_PREFIX"))     -- e.g. stream_live
+local OFFLINE_PREFIX = normalize(requireEnv("MC_OFFLINE_PREFIX"))  -- e.g. stream_offline
 
 local DEBUG_COMMANDS = envBool(requireEnv("DEBUG_COMMANDS"))
 
@@ -178,7 +180,8 @@ echo("Cube Item ID", CUBE_ITEM)
 echo("Bits Per Cube", BITS_PER_CUBE)
 echo("Tellraw Command", TELLRAW_CMD)
 echo("Give Command", GIVE_CMD)
-echo("Streaming Command", STREAMING_CMD)
+echo("Live Prefix", LIVE_PREFIX)
+echo("Offline Prefix", OFFLINE_PREFIX)
 echo("Sub Cubes Prime", CUBES_SUB_PRIME)
 echo("Sub Cubes Tier1", CUBES_SUB_T1)
 echo("Sub Cubes Tier2", CUBES_SUB_T2)
@@ -256,11 +259,14 @@ local function tellrawClickable(prefixLabel, baseColor, accentColor, labelText, 
 end
 
 -------------------------------------------------
--- Streaming hook
+-- Live hook (Option 2)
 -------------------------------------------------
-local function runStreamingToggle()
-  -- Runs: /streaming <MC_PLAYER>
-  runCommand(string.format("%s %s", STREAMING_CMD, MC_PLAYER))
+local function runLiveHook(isLive)
+  if isLive then
+    runCommand(string.format("%s %s", LIVE_PREFIX, MC_PLAYER))
+  else
+    runCommand(string.format("%s %s", OFFLINE_PREFIX, MC_PLAYER))
+  end
 end
 
 -------------------------------------------------
@@ -317,10 +323,10 @@ local function setLive(newState, reason)
   if STREAM_LIVE == newState then return end
 
   STREAM_LIVE = newState
-
-  -- Announce + run /streaming <player>
   tellrawCubes((STREAM_LIVE and "Stream is LIVE" or "Stream is OFFLINE") .. (reason and (" (" .. reason .. ")") or ""))
-  runStreamingToggle()
+
+  -- Run your live/offline prefix command
+  runLiveHook(STREAM_LIVE)
 end
 
 -------------------------------------------------
@@ -359,19 +365,8 @@ end
 
 -- Regular subs only (ignore gifts here to avoid double counting)
 local function handleSubscribeEvent(ev)
-  if not STREAM_LIVE then
-    if DEBUG_COMMANDS then
-      color(colors.gray)
-      print("[SKIP] Offline: channel.subscribe")
-      color(colors.white)
-    end
-    return
-  end
-
-  if ev.is_gift == true then
-    -- Gift recipients may fire as channel.subscribe events; ignore.
-    return
-  end
+  if not STREAM_LIVE then return end
+  if ev.is_gift == true then return end
 
   local perSub = cubesForTier(ev.tier, ev.is_prime)
   local user = sanitizeText(ev.user_name or ev.user_login or "Someone")
@@ -382,14 +377,7 @@ end
 
 -- Gift bombs (community gifts) handled here
 local function handleGiftEvent(ev)
-  if not STREAM_LIVE then
-    if DEBUG_COMMANDS then
-      color(colors.gray)
-      print("[SKIP] Offline: channel.subscription.gift")
-      color(colors.white)
-    end
-    return
-  end
+  if not STREAM_LIVE then return end
 
   local perSub = cubesForTier(ev.tier, ev.is_prime)
   local count = tonumber(ev.total or ev.quantity or ev.count or 1) or 1
@@ -482,7 +470,7 @@ local function scopesChanged(token, desiredScopeStr)
   if not token then return true end
   local old = token._requested_scopes
   if type(old) ~= "string" or old == "" then
-    return true -- old token file didn’t store scopes
+    return true
   end
   return old ~= desiredScopeStr
 end
@@ -539,7 +527,7 @@ local function ensureToken()
       true
     )
 
-    -- Better error visibility for other users
+    -- Better errors for "anyone can use it"
     if not resp then
       error("Token exchange failed: no response (http_failure or invalid JSON).", 0)
     end
@@ -608,7 +596,7 @@ end
 
 local broadcasterId = getBroadcasterId()
 
--- Initial LIVE state: one quick Helix check so "only works when live" behaves immediately
+-- Initial LIVE state so "only works when live" starts correct immediately
 local function isLiveNow()
   local data = httpJson(
     "GET",
@@ -620,7 +608,7 @@ end
 
 STREAM_LIVE = isLiveNow()
 tellrawCubes(STREAM_LIVE and "Online (LIVE)" or "Online (OFFLINE)")
-runStreamingToggle() -- run once at boot so your server-side state can sync
+runLiveHook(STREAM_LIVE) -- sync your server-side state on boot
 
 local WS = "wss://eventsub.wss.twitch.tv/ws"
 http.websocketAsync(WS)
@@ -691,9 +679,11 @@ while true do
       elseif mtype == "notification" then
         local sub = d.payload and d.payload.subscription
         local ev  = d.payload and d.payload.event
+
         if sub and ev and sub.type then
           if sub.type == "stream.online" then
             setLive(true, "EventSub")
+
           elseif sub.type == "stream.offline" then
             setLive(false, "EventSub")
 
