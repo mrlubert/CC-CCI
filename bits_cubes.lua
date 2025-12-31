@@ -13,6 +13,11 @@
 -- IMPORTANT:
 --  - Gift bombs handled via: channel.subscription.gift (reliable count)
 --  - Regular subs handled via: channel.subscribe (NON-gift only) to avoid double counting
+--
+-- FIX: False "LIVE" on boot
+--  - Add .env key: ASSUME_OFFLINE_ON_BOOT=true/false
+--  - If true: start OFFLINE and wait for EventSub stream.online to flip LIVE.
+--  - If false: do a STRICT Helix /streams check (errors -> OFFLINE), and print resolved broadcaster login/id.
 
 local ENV_PATH   = ".env"
 local TOKEN_FILE = "twitch_tokens.json"
@@ -118,6 +123,11 @@ local GIVE_CMD    = normalize(requireEnv("MC_GIVE_PREFIX"))    -- e.g. give   OR
 local LIVE_PREFIX    = normalize(requireEnv("MC_LIVE_PREFIX"))     -- e.g. stream_live
 local OFFLINE_PREFIX = normalize(requireEnv("MC_OFFLINE_PREFIX"))  -- e.g. stream_offline
 
+-- Safe boot toggle (recommended true so you never false-positive LIVE)
+-- Add to .env:
+-- ASSUME_OFFLINE_ON_BOOT=true
+local ASSUME_OFFLINE_ON_BOOT = envBool(requireEnv("ASSUME_OFFLINE_ON_BOOT"))
+
 local DEBUG_COMMANDS = envBool(requireEnv("DEBUG_COMMANDS"))
 
 -- Sub cube values (configurable per tier)
@@ -182,6 +192,7 @@ echo("Tellraw Command", TELLRAW_CMD)
 echo("Give Command", GIVE_CMD)
 echo("Live Prefix", LIVE_PREFIX)
 echo("Offline Prefix", OFFLINE_PREFIX)
+echo("Assume Offline On Boot", ASSUME_OFFLINE_ON_BOOT and "YES" or "NO")
 echo("Sub Cubes Prime", CUBES_SUB_PRIME)
 echo("Sub Cubes Tier1", CUBES_SUB_T1)
 echo("Sub Cubes Tier2", CUBES_SUB_T2)
@@ -380,6 +391,9 @@ local function handleGiftEvent(ev)
   if not STREAM_LIVE then return end
 
   local perSub = cubesForTier(ev.tier, ev.is_prime)
+
+  -- For channel.subscription.gift, EventSub provides total gifts in the event as total
+  -- Some payloads may include "total" or "quantity"; we try both.
   local count = tonumber(ev.total or ev.quantity or ev.count or 1) or 1
   if count < 1 then count = 1 end
 
@@ -582,31 +596,66 @@ local headers = {
   ["Authorization"] = "Bearer " .. token.access_token
 }
 
-local function getBroadcasterId()
+-- FIX: resolve broadcaster STRICTLY and print who we actually matched
+local function getBroadcasterInfo()
   local data = httpJson(
     "GET",
     "https://api.twitch.tv/helix/users?login=" .. textutils.urlEncode(BROADCASTER),
     headers
   )
-  if not data or not data.data or not data.data[1] or not data.data[1].id then
-    error("Failed to fetch broadcaster id for TWITCH_BROADCASTER_LOGIN=" .. BROADCASTER, 0)
+
+  if not data then
+    error("Failed to fetch broadcaster info: no response", 0)
   end
-  return data.data[1].id
+  if data.error then
+    error("Failed to fetch broadcaster info: " .. tostring(data.message or data.error), 0)
+  end
+  if not data.data or not data.data[1] then
+    error("No Twitch user found for TWITCH_BROADCASTER_LOGIN=" .. BROADCASTER, 0)
+  end
+
+  local u = data.data[1]
+  print("Resolved broadcaster:")
+  print("  login=" .. tostring(u.login) .. "  id=" .. tostring(u.id))
+
+  return u.id
 end
 
-local broadcasterId = getBroadcasterId()
+local broadcasterId = getBroadcasterInfo()
 
--- Initial LIVE state so "only works when live" starts correct immediately
-local function isLiveNow()
+-- FIX: strict live check (errors -> OFFLINE)
+local function isLiveNowStrict()
   local data = httpJson(
     "GET",
     "https://api.twitch.tv/helix/streams?user_id=" .. textutils.urlEncode(broadcasterId),
     headers
   )
-  return data and data.data and #data.data > 0
+
+  if not data then
+    print("[WARN] Live check failed (no response). Assuming OFFLINE.")
+    return false
+  end
+  if data.error then
+    print("[WARN] Live check error: " .. tostring(data.message or data.error) .. ". Assuming OFFLINE.")
+    return false
+  end
+  if type(data.data) ~= "table" then
+    print("[WARN] Live check returned unexpected data. Assuming OFFLINE.")
+    return false
+  end
+
+  return data.data[1] ~= nil
 end
 
-STREAM_LIVE = isLiveNow()
+-- Boot behavior:
+-- - If ASSUME_OFFLINE_ON_BOOT=true: always start OFFLINE and wait for EventSub online/offline
+-- - Else: do strict helix check
+if ASSUME_OFFLINE_ON_BOOT then
+  STREAM_LIVE = false
+else
+  STREAM_LIVE = isLiveNowStrict()
+end
+
 tellrawCubes(STREAM_LIVE and "Online (LIVE)" or "Online (OFFLINE)")
 runLiveHook(STREAM_LIVE) -- sync your server-side state on boot
 
