@@ -14,10 +14,11 @@
 --  - Gift bombs handled via: channel.subscription.gift (reliable count)
 --  - Regular subs handled via: channel.subscribe (NON-gift only) to avoid double counting
 --
--- FIX: False "LIVE" on boot
---  - Add .env key: ASSUME_OFFLINE_ON_BOOT=true/false
---  - If true: start OFFLINE and wait for EventSub stream.online to flip LIVE.
---  - If false: do a STRICT Helix /streams check (errors -> OFFLINE), and print resolved broadcaster login/id.
+-- BOOT FIXES:
+--  - Do NOT run live/offline command on startup.
+--  - Do NOT run OFFLINE command if we start offline.
+--  - Only run OFFLINE command when transitioning from LIVE -> OFFLINE (to toggle live off).
+--  - Track "known live state" once Helix check or EventSub tells us.
 
 local ENV_PATH   = ".env"
 local TOKEN_FILE = "twitch_tokens.json"
@@ -42,7 +43,6 @@ local function clampLen(s, n)
   return s
 end
 
--- Keep it simple & safe: remove weird Unicode pipelines
 local function sanitizeText(s)
   s = tostring(s or "")
   s = s:gsub("[^\x20-\x7E]", "?")
@@ -115,39 +115,29 @@ local MC_PLAYER     = requireEnv("MC_PLAYER")
 local CUBE_ITEM     = requireEnv("CUBE_ITEM_ID")
 local BITS_PER_CUBE = envNumRequired("BITS_PER_CUBE")
 
--- Actual command strings (can be wrappers)
-local TELLRAW_CMD = normalize(requireEnv("MC_TELLRAW_PREFIX")) -- e.g. tellraw OR execute ... run tellraw
-local GIVE_CMD    = normalize(requireEnv("MC_GIVE_PREFIX"))    -- e.g. give   OR execute ... run give
+local TELLRAW_CMD = normalize(requireEnv("MC_TELLRAW_PREFIX"))
+local GIVE_CMD    = normalize(requireEnv("MC_GIVE_PREFIX"))
 
--- LIVE/OFFLINE command prefixes (Option 2)
-local LIVE_PREFIX    = normalize(requireEnv("MC_LIVE_PREFIX"))     -- e.g. stream_live
-local OFFLINE_PREFIX = normalize(requireEnv("MC_OFFLINE_PREFIX"))  -- e.g. stream_offline
-
--- Safe boot toggle (recommended true so you never false-positive LIVE)
--- Add to .env:
--- ASSUME_OFFLINE_ON_BOOT=true
-local ASSUME_OFFLINE_ON_BOOT = envBool(requireEnv("ASSUME_OFFLINE_ON_BOOT"))
+local LIVE_PREFIX    = normalize(requireEnv("MC_LIVE_PREFIX"))
+local OFFLINE_PREFIX = normalize(requireEnv("MC_OFFLINE_PREFIX"))
 
 local DEBUG_COMMANDS = envBool(requireEnv("DEBUG_COMMANDS"))
 
--- Sub cube values (configurable per tier)
 local CUBES_SUB_PRIME = envNumRequired("CUBES_SUB_PRIME")
 local CUBES_SUB_T1    = envNumRequired("CUBES_SUB_T1")
 local CUBES_SUB_T2    = envNumRequired("CUBES_SUB_T2")
 local CUBES_SUB_T3    = envNumRequired("CUBES_SUB_T3")
 
--- Twitch chat relay (toggle)
 local RELAY_TWITCH_CHAT = envBool(requireEnv("RELAY_TWITCH_CHAT"))
 local CHAT_RELAY_MAXLEN = envNumOptional("CHAT_RELAY_MAXLEN", 180)
 
--- JSON prefix styling (replaces unreliable § codes)
-local PREFIX_CUBES_LABEL  = requireEnv("PREFIX_CUBES_LABEL")   -- e.g. Cubes
-local PREFIX_CUBES_COLOR  = requireEnv("PREFIX_CUBES_COLOR")   -- e.g. black
-local PREFIX_CUBES_ACCENT = requireEnv("PREFIX_CUBES_ACCENT")  -- e.g. aqua
+local PREFIX_CUBES_LABEL  = requireEnv("PREFIX_CUBES_LABEL")
+local PREFIX_CUBES_COLOR  = requireEnv("PREFIX_CUBES_COLOR")
+local PREFIX_CUBES_ACCENT = requireEnv("PREFIX_CUBES_ACCENT")
 
-local PREFIX_TWITCH_LABEL  = requireEnv("PREFIX_TWITCH_LABEL") -- e.g. Twitch
-local PREFIX_TWITCH_COLOR  = requireEnv("PREFIX_TWITCH_COLOR") -- e.g. black
-local PREFIX_TWITCH_ACCENT = requireEnv("PREFIX_TWITCH_ACCENT")-- e.g. dark_purple
+local PREFIX_TWITCH_LABEL  = requireEnv("PREFIX_TWITCH_LABEL")
+local PREFIX_TWITCH_COLOR  = requireEnv("PREFIX_TWITCH_COLOR")
+local PREFIX_TWITCH_ACCENT = requireEnv("PREFIX_TWITCH_ACCENT")
 
 -------------------------------------------------
 -- Terminal helpers
@@ -192,11 +182,6 @@ echo("Tellraw Command", TELLRAW_CMD)
 echo("Give Command", GIVE_CMD)
 echo("Live Prefix", LIVE_PREFIX)
 echo("Offline Prefix", OFFLINE_PREFIX)
-echo("Assume Offline On Boot", ASSUME_OFFLINE_ON_BOOT and "YES" or "NO")
-echo("Sub Cubes Prime", CUBES_SUB_PRIME)
-echo("Sub Cubes Tier1", CUBES_SUB_T1)
-echo("Sub Cubes Tier2", CUBES_SUB_T2)
-echo("Sub Cubes Tier3", CUBES_SUB_T3)
 echo("Relay Twitch Chat", RELAY_TWITCH_CHAT and "ON" or "OFF")
 if RELAY_TWITCH_CHAT then echo("Chat Relay MaxLen", CHAT_RELAY_MAXLEN) end
 echo("Prefix Cubes", "[" .. PREFIX_CUBES_LABEL .. "] (" .. PREFIX_CUBES_COLOR .. "/" .. PREFIX_CUBES_ACCENT .. ")")
@@ -270,14 +255,16 @@ local function tellrawClickable(prefixLabel, baseColor, accentColor, labelText, 
 end
 
 -------------------------------------------------
--- Live hook (Option 2)
+-- Live hook (Option 2) - NOTE:
+--  * We NEVER run this on startup.
+--  * OFFLINE command only runs when transitioning from LIVE -> OFFLINE.
 -------------------------------------------------
-local function runLiveHook(isLive)
-  if isLive then
-    runCommand(string.format("%s %s", LIVE_PREFIX, MC_PLAYER))
-  else
-    runCommand(string.format("%s %s", OFFLINE_PREFIX, MC_PLAYER))
-  end
+local function runLiveCommand()
+  runCommand(string.format("%s %s", LIVE_PREFIX, MC_PLAYER))
+end
+
+local function runOfflineCommand()
+  runCommand(string.format("%s %s", OFFLINE_PREFIX, MC_PLAYER))
 end
 
 -------------------------------------------------
@@ -328,16 +315,32 @@ local bank = readJson(BANK_FILE) or { remainder = {} }
 -- LIVE gating
 -------------------------------------------------
 local STREAM_LIVE = false
+local LIVE_KNOWN  = false  -- becomes true once we have a reliable answer
 
+-- Only run OFFLINE command when it actually needs to toggle live OFF.
 local function setLive(newState, reason)
   newState = (newState == true)
+
+  -- Mark state as "known" the first time we learn it
+  if not LIVE_KNOWN then LIVE_KNOWN = true end
+
   if STREAM_LIVE == newState then return end
 
+  local wasLive = STREAM_LIVE
   STREAM_LIVE = newState
+
   tellrawCubes((STREAM_LIVE and "Stream is LIVE" or "Stream is OFFLINE") .. (reason and (" (" .. reason .. ")") or ""))
 
-  -- Run your live/offline prefix command
-  runLiveHook(STREAM_LIVE)
+  if STREAM_LIVE then
+    -- Transition OFFLINE -> LIVE: run LIVE command
+    runLiveCommand()
+  else
+    -- Transition LIVE -> OFFLINE: run OFFLINE command
+    -- BUT ONLY if we were live before (so it actually toggles off)
+    if wasLive then
+      runOfflineCommand()
+    end
+  end
 end
 
 -------------------------------------------------
@@ -374,7 +377,6 @@ local function cubesForTier(tierStr, isPrime)
   return CUBES_SUB_T1
 end
 
--- Regular subs only (ignore gifts here to avoid double counting)
 local function handleSubscribeEvent(ev)
   if not STREAM_LIVE then return end
   if ev.is_gift == true then return end
@@ -386,14 +388,10 @@ local function handleSubscribeEvent(ev)
   tellrawCubes(string.format("%s subscribed -> %d cube(s)", user, perSub))
 end
 
--- Gift bombs (community gifts) handled here
 local function handleGiftEvent(ev)
   if not STREAM_LIVE then return end
 
   local perSub = cubesForTier(ev.tier, ev.is_prime)
-
-  -- For channel.subscription.gift, EventSub provides total gifts in the event as total
-  -- Some payloads may include "total" or "quantity"; we try both.
   local count = tonumber(ev.total or ev.quantity or ev.count or 1) or 1
   if count < 1 then count = 1 end
 
@@ -404,9 +402,6 @@ local function handleGiftEvent(ev)
   tellrawCubes(string.format("%s gifted %d sub(s) -> %d cube(s)", gifter, count, cubes))
 end
 
--------------------------------------------------
--- Twitch chat relay (ONLY when live)
--------------------------------------------------
 local function handleChatMessageEvent(ev)
   if not RELAY_TWITCH_CHAT then return end
   if not STREAM_LIVE then return end
@@ -541,7 +536,6 @@ local function ensureToken()
       true
     )
 
-    -- Better errors for "anyone can use it"
     if not resp then
       error("Token exchange failed: no response (http_failure or invalid JSON).", 0)
     end
@@ -596,68 +590,48 @@ local headers = {
   ["Authorization"] = "Bearer " .. token.access_token
 }
 
--- FIX: resolve broadcaster STRICTLY and print who we actually matched
-local function getBroadcasterInfo()
+local function getBroadcasterId()
   local data = httpJson(
     "GET",
     "https://api.twitch.tv/helix/users?login=" .. textutils.urlEncode(BROADCASTER),
     headers
   )
-
-  if not data then
-    error("Failed to fetch broadcaster info: no response", 0)
+  if not data or not data.data or not data.data[1] or not data.data[1].id then
+    error("Failed to fetch broadcaster id for TWITCH_BROADCASTER_LOGIN=" .. BROADCASTER, 0)
   end
-  if data.error then
-    error("Failed to fetch broadcaster info: " .. tostring(data.message or data.error), 0)
-  end
-  if not data.data or not data.data[1] then
-    error("No Twitch user found for TWITCH_BROADCASTER_LOGIN=" .. BROADCASTER, 0)
-  end
-
-  local u = data.data[1]
-  print("Resolved broadcaster:")
-  print("  login=" .. tostring(u.login) .. "  id=" .. tostring(u.id))
-
-  return u.id
+  return data.data[1].id
 end
 
-local broadcasterId = getBroadcasterInfo()
+local broadcasterId = getBroadcasterId()
 
--- FIX: strict live check (errors -> OFFLINE)
+-- STRICT live check (errors -> false)
 local function isLiveNowStrict()
   local data = httpJson(
     "GET",
     "https://api.twitch.tv/helix/streams?user_id=" .. textutils.urlEncode(broadcasterId),
     headers
   )
-
-  if not data then
-    print("[WARN] Live check failed (no response). Assuming OFFLINE.")
-    return false
-  end
-  if data.error then
-    print("[WARN] Live check error: " .. tostring(data.message or data.error) .. ". Assuming OFFLINE.")
-    return false
-  end
-  if type(data.data) ~= "table" then
-    print("[WARN] Live check returned unexpected data. Assuming OFFLINE.")
-    return false
-  end
-
+  if not data or data.error then return false end
+  if type(data.data) ~= "table" then return false end
   return data.data[1] ~= nil
 end
 
--- Boot behavior:
--- - If ASSUME_OFFLINE_ON_BOOT=true: always start OFFLINE and wait for EventSub online/offline
--- - Else: do strict helix check
-if ASSUME_OFFLINE_ON_BOOT then
-  STREAM_LIVE = false
-else
-  STREAM_LIVE = isLiveNowStrict()
-end
+-- STARTUP BEHAVIOR:
+-- 1) We tell the user "Starting..." and DO NOT run live/offline commands.
+-- 2) We determine live state.
+-- 3) If LIVE, we run LIVE command.
+-- 4) If OFFLINE, we DO NOT run OFFLINE command (because it toggles live OFF only).
+tellrawCubes("Starting... (checking stream status)")
+STREAM_LIVE = isLiveNowStrict()
+LIVE_KNOWN = true
 
-tellrawCubes(STREAM_LIVE and "Online (LIVE)" or "Online (OFFLINE)")
-runLiveHook(STREAM_LIVE) -- sync your server-side state on boot
+if STREAM_LIVE then
+  tellrawCubes("Online (LIVE)")
+  runLiveCommand()
+else
+  tellrawCubes("Online (OFFLINE)")
+  -- DO NOT run offline command here
+end
 
 local WS = "wss://eventsub.wss.twitch.tv/ws"
 http.websocketAsync(WS)
@@ -673,7 +647,6 @@ while true do
       if mtype == "session_welcome" then
         local sessionId = d.payload and d.payload.session and d.payload.session.id
         if sessionId then
-          -- Stream online/offline (LIVE gating)
           httpJson("POST", "https://api.twitch.tv/helix/eventsub/subscriptions", headers, {
             type = "stream.online",
             version = "1",
@@ -688,7 +661,6 @@ while true do
             transport = { method = "websocket", session_id = sessionId }
           })
 
-          -- Bits
           httpJson("POST", "https://api.twitch.tv/helix/eventsub/subscriptions", headers, {
             type = "channel.cheer",
             version = "1",
@@ -696,7 +668,6 @@ while true do
             transport = { method = "websocket", session_id = sessionId }
           })
 
-          -- Regular subs (ignore gifts here)
           httpJson("POST", "https://api.twitch.tv/helix/eventsub/subscriptions", headers, {
             type = "channel.subscribe",
             version = "1",
@@ -704,7 +675,6 @@ while true do
             transport = { method = "websocket", session_id = sessionId }
           })
 
-          -- Gift bombs (reliable count)
           httpJson("POST", "https://api.twitch.tv/helix/eventsub/subscriptions", headers, {
             type = "channel.subscription.gift",
             version = "1",
@@ -712,7 +682,6 @@ while true do
             transport = { method = "websocket", session_id = sessionId }
           })
 
-          -- Chat relay (optional)
           if RELAY_TWITCH_CHAT then
             httpJson("POST", "https://api.twitch.tv/helix/eventsub/subscriptions", headers, {
               type = "channel.chat.message",
